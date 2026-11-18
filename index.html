@@ -97,19 +97,16 @@
         </div>
     </div>
     <script type="module">
-        import init, {
-            init_world,
-            spawn_agent,
-            spawn_food,
-            step,
-            get_agents_state,
-            get_food_state,
-            get_walls_state,
-            get_grasslands_state,
-            get_world_time,
-            get_heatmap_state,
-            get_pop_stats,
-        } from './pkg/rust_life_sim.js';
+        // Dynamic timestamp cache-bust for WASM module
+        const TS = Date.now();
+        const WASM_URL = `./pkg/rust_life_sim.js?v=${TS}`;
+        let init, init_world, spawn_agent, spawn_food, step,
+            get_agents_state, get_food_state, get_walls_state,
+            get_grasslands_state, get_world_time, get_heatmap_state, get_pop_stats;
+        ({ default: init, spawn_food, step, init_world, spawn_agent,
+           get_agents_state, get_food_state, get_walls_state,
+           get_grasslands_state, get_world_time, get_heatmap_state, get_pop_stats }
+          = await import(WASM_URL));
 
         const W = 400, H = 300;
         let simSpeed = 1;
@@ -155,7 +152,7 @@
 
         async function run() {
             try {
-                await init();
+                await init(`./pkg/rust_life_sim_bg.wasm?v=${TS}`);
             } catch(e) {
                 const loadingEl = document.getElementById('loading');
                 if (loadingEl) {
