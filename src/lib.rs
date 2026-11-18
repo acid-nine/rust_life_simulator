@@ -10,6 +10,11 @@ const FOOD_ENERGY: f32 = 40.0;
 const FOOD_TTL: u32 = 400;
 const CARCASS_TTL: u32 = 150;
 
+// Agent energy economy: starting energy, metabolism scale, reproduction threshold
+const AGENT_START_ENERGY: f32 = 200.0;
+const METABOLISM_SCALE: f32 = 0.001; // was 0.05 base + 0.01*speed^2*size
+const REPRO_THRESHOLD_BASE: f32 = 180.0;
+
 // Heatmap: 80×60 grid (one cell = 10×10 world pixels). Max value 50, decays 1/tick.
 const HEAT_W: usize = 80;
 const HEAT_H: usize = 60;
@@ -82,6 +87,11 @@ pub struct World {
     rng: u32,
     next_id: u32,
     heatmap: Heatmap,
+    // Population tracking
+    total_births: u32,
+    total_deaths: u32,
+    // Seasonal cycle: 0-999=spring, 1000-1999=summer, 2000-2999=autumn, 3000-3999=winter
+    season: u32,
 }
 
 impl World {
@@ -95,8 +105,10 @@ impl World {
         (x >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    fn mutate(&mut self, v: f32, lo: f32, hi: f32) -> f32 {
-        (v * (1.0 + (self.rand() - 0.5) * 0.2)).clamp(lo, hi)
+    fn mutate_stress(&mut self, v: f32, lo: f32, hi: f32, stress: f32) -> f32 {
+        // stress in [0, 1]; 0=normal mutation, 1=chaotic mutation
+        let range = 0.2 + stress * 0.8;
+        (v * (1.0 + (self.rand() - 0.5) * range * 2.0)).clamp(lo, hi)
     }
 
     /// Fade heatmap toward zero.
@@ -146,9 +158,25 @@ pub fn init_world(width: f32, height: f32, seed: u32) {
             Grassland { x: 600.0, y: 100.0, radius: 80.0, regrow_timer: 0 },
         ],
         time: 0,
-        rng: seed.max(1), // xorshift must not start at 0
+        rng: seed.max(1),
         next_id: 1,
         heatmap: [0.0; HEAT_W * HEAT_H],
+        total_births: 0,
+        total_deaths: 0,
+        season: 0,
+    });
+    // Seed grasslands with initial food.
+    with_world(|w| {
+        let grasslands: Vec<(f32, f32, f32)> = w.grasslands.iter().map(|g| (g.x, g.y, g.radius)).collect();
+        for (gx, gy, gr) in grasslands {
+            for _ in 0..8 {
+                let p = Point {
+                    x: gx + (w.rand() - 0.5) * (gr * 0.8),
+                    y: gy + (w.rand() - 0.5) * (gr * 0.8),
+                };
+                w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
+            }
+        }
     });
 }
 
@@ -163,9 +191,9 @@ pub fn spawn_agent(x: f32, y: f32) {
             speed: 1.0 + w.rand(),
             size: 2.0 + w.rand() * 2.0,
             sense: 40.0 + w.rand() * 40.0,
-            energy: 100.0,
+            energy: AGENT_START_ENERGY,
             species: if w.rand() > 0.9 { 1 } else { 0 },
-            repro_threshold: 150.0 + w.rand() * 50.0,
+            repro_threshold: REPRO_THRESHOLD_BASE + w.rand() * 50.0,
             metabolism_eff: 0.8 + w.rand() * 0.4,
             age: 0,
             lineage: w.next_id,
@@ -194,6 +222,18 @@ pub fn spawn_food() {
 #[wasm_bindgen]
 pub fn step() {
     with_world(|w| {
+        // Advance time and track season at the top of each tick.
+        let old_time = w.time;
+        w.time = (old_time + 1) % 4000;
+        w.season = w.time / 1000;
+        // Seasonal metabolism multiplier.
+        let season_metab = match w.season {
+            0 => 1.0,   // spring: normal
+            1 => 1.3,   // summer: hotter, burn more
+            2 => 1.2,   // autumn: moderate
+            _ => 1.8,   // winter: harsh
+        };
+
         // Decay existing food; pruned before agents act so new food isn't touched this tick.
         for f in &mut w.food {
             if f.ttl > 0 {
@@ -215,7 +255,9 @@ pub fn step() {
             // Metabolism: fast, big, far-sighted agents burn more.
             let night = (w.time % 2000) > 1000;
             let current_sense = if night { a.sense * 0.5 } else { a.sense };
-            a.energy -= (0.05 + 0.01 * a.speed * a.speed * a.size + 0.001 * current_sense) * (1.0 - a.metabolism_eff);
+            // Quadratic cost for speed+size, linear for sense; halved by metabolism_eff
+            let metabolism = (METABOLISM_SCALE * a.speed * a.speed * a.size + 0.0003 * current_sense) * (1.0 - a.metabolism_eff) * season_metab;
+            a.energy -= metabolism.max(0.0);
             
             if a.species == 0 {
                 // Prey: Find nearest food within sense range.
@@ -226,7 +268,7 @@ pub fn step() {
                         best = Some((j, d2));
                     }
                 }
-                
+
                 match best {
                     Some((j, d2)) if d2.sqrt() <= a.size + 3.0 => {
                         let f = &w.food[j];
@@ -242,13 +284,27 @@ pub fn step() {
                         let f = &w.food[j];
                         a.heading = (f.pos.y - a.y).atan2(f.pos.x - a.x);
                     }
-                    None => a.heading += (w.rand() - 0.5) * 0.6,
+                    None => {
+                        // Bias toward nearest grassland instead of pure random walk.
+                        let mut nearest_g: Option<(f32, f32, f32)> = None; // (dist, x, y)
+                        for g in &w.grasslands {
+                            let d2 = (g.x - a.x).powi(2) + (g.y - a.y).powi(2);
+                            if nearest_g.is_none_or(|(bd, _, _)| d2 < bd) {
+                                nearest_g = Some((d2, g.x, g.y));
+                            }
+                        }
+                        if let Some((_d2, gx, gy)) = nearest_g {
+                            a.heading = (gy - a.y).atan2(gx - a.x);
+                        } else {
+                            a.heading += (w.rand() - 0.5) * 0.6;
+                        }
+                    }
                 }
             } else {
                 // Predator: Find nearest prey (species 0) within sense range.
                 let mut best_prey: Option<(usize, f32)> = None;
                 for (j, other) in w.agents.iter().enumerate() {
-                    if other.species == 0 {
+                    if other.species == 0 && other.energy > 0.0 {
                         let d2 = (other.x - a.x).powi(2) + (other.y - a.y).powi(2);
                         if d2 < current_sense * current_sense && best_prey.is_none_or(|(_, b)| d2 < b) {
                             best_prey = Some((j, d2));
@@ -331,21 +387,24 @@ pub fn step() {
             // Reproduce: split energy with a mutated child.
             if a.energy > a.repro_threshold && n + babies.len() < MAX_AGENTS {
                 a.energy /= 2.0;
+                // Stress-induced mutation: agents near death mutate more (evolutionary pressure).
+                let stress = if a.energy > 0.0 { (a.repro_threshold - a.energy) / a.repro_threshold } else { 0.0 };
                 let child = Agent {
                     id: w.next_id,
                     heading: w.rand() * 2.0 * PI,
-                    speed: w.mutate(a.speed, 0.3, 5.0),
-                    size: w.mutate(a.size, 1.0, 10.0),
-                    sense: w.mutate(a.sense, 10.0, 200.0),
+                    speed: w.mutate_stress(a.speed, 0.3, 5.0, stress),
+                    size: w.mutate_stress(a.size, 1.0, 10.0, stress),
+                    sense: w.mutate_stress(a.sense, 10.0, 200.0, stress),
                     species: a.species,
-                    repro_threshold: w.mutate(a.repro_threshold, 100.0, 250.0),
-                    metabolism_eff: w.mutate(a.metabolism_eff, 0.5, 1.0),
+                    repro_threshold: w.mutate_stress(a.repro_threshold, 100.0, 250.0, stress),
+                    metabolism_eff: w.mutate_stress(a.metabolism_eff, 0.5, 1.0, stress),
                     age: 0,
                     generation: a.generation + 1,
                     ..a.clone()
                 };
                 w.next_id += 1;
                 w.record_heatmap(child.x, child.y, false);
+                w.total_births += 1;
                 babies.push(child);
             }
             
@@ -355,27 +414,38 @@ pub fn step() {
         // Index-based so a &mut borrow of grasslands is never held across w.rand()/w.food.
         for gi in 0..w.grasslands.len() {
             let resting = w.grasslands[gi].regrow_timer > 0;
-            let should_spawn = !resting && w.food.iter().filter(|f| {
-                let d2 = (f.pos.x - w.grasslands[gi].x).powi(2) + (f.pos.y - w.grasslands[gi].y).powi(2);
-                d2 < w.grasslands[gi].radius * w.grasslands[gi].radius
-            }).count() < 10;
+            let local_radius = w.grasslands[gi].radius;
+            let (gx, gy) = (w.grasslands[gi].x, w.grasslands[gi].y);
+            // Count food within THIS grassland's radius
+            let local_food_count = w.food.iter().filter(|f| {
+                let d2 = (f.pos.x - gx).powi(2) + (f.pos.y - gy).powi(2);
+                d2 < local_radius * local_radius
+            }).count();
+            let should_spawn = !resting && local_food_count < 10;
 
             if resting {
                 w.grasslands[gi].regrow_timer -= 1;
             } else if should_spawn {
-                let (gx, gy, gr) = (w.grasslands[gi].x, w.grasslands[gi].y, w.grasslands[gi].radius);
-                let p = Point {
-                    x: gx + (w.rand() - 0.5) * (gr * 0.8),
-                    y: gy + (w.rand() - 0.5) * (gr * 0.8),
-                };
-                w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
+                // In winter, grasslands only grow 20% as often.
+                let winter_penalty = if w.season == 3 { 0.2 } else { 1.0 };
+                if w.rand() < winter_penalty {
+                    let gr = local_radius;
+                    let f_type = match w.rand() {
+                        r if r < 0.15 => FoodType::HighEnergy,
+                        r if r < 0.25 => FoodType::Poisonous,
+                        _ => FoodType::Normal,
+                    };
+                    let p = Point {
+                        x: gx + (w.rand() - 0.5) * (gr * 0.8),
+                        y: gy + (w.rand() - 0.5) * (gr * 0.8),
+                    };
+                    w.food.push(Food { pos: p, f_type, ttl: FOOD_TTL });
+                }
             } else {
                 w.grasslands[gi].regrow_timer = 100;
             }
         }
         
-        w.time = (w.time + 1) % 2000;
-
         // Dead agents become carcasses, closing the food chain (prey -> food).
         let mut survivors = Vec::with_capacity(w.agents.len());
         let mut deaths = Vec::new(); // positions of dead agents
@@ -384,6 +454,7 @@ pub fn step() {
                 survivors.push(a);
             } else {
                 deaths.push((a.x, a.y));
+                w.total_deaths += 1;
                 if w.food.len() < MAX_FOOD {
                     w.food.push(Food { pos: Point { x: a.x, y: a.y }, f_type: FoodType::Carcass, ttl: CARCASS_TTL });
                 }
@@ -395,6 +466,16 @@ pub fn step() {
         }
         w.agents = survivors;
         w.agents.extend(babies);
+
+        // Ensure world starts with enough food.
+        if w.time == 0 {
+            let mut spawned = 0;
+            while w.food.len() < 80 && spawned < 200 {
+                let p = Point { x: w.rand() * w.width, y: w.rand() * w.height };
+                w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
+                spawned += 1;
+            }
+        }
     });
 }
 
@@ -436,6 +517,16 @@ pub fn get_world_time() -> u32 {
 pub fn get_heatmap_state() -> Vec<f32> {
     with_world(|w| w.heatmap.to_vec())
         .unwrap_or_else(|| vec![0.0; HEAT_W * HEAT_H])
+}
+
+#[wasm_bindgen]
+pub fn get_pop_stats() -> String {
+    with_world(|w| {
+        let season_names = ["Spring", "Summer", "Autumn", "Winter"];
+        let s = season_names.get(w.season as usize).unwrap_or(&"Spring");
+        format!(r#"{{"births":{}, "deaths":{}, "season":"{}"}}"#, w.total_births, w.total_deaths, s)
+    })
+    .unwrap_or_else(|| r#"{"births":0,"deaths":0,"season":"Spring"}"#.into())
 }
 
 #[cfg(test)]

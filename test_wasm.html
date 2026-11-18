@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>WASM Test</title></head>
+<body style="background:#222;color:#fff;font-family:monospace;padding:20px;">
+  <div id="log"></div>
+  <script type="module">
+    const log = (msg, data) => {
+      const d = document.createElement('div');
+      d.textContent = msg + (data !== undefined ? ': ' + JSON.stringify(data) : '');
+      document.getElementById('log').appendChild(d);
+    };
+    try {
+      log('Starting import...');
+      const m = await import('http://localhost:8080/pkg/rust_life_sim.js');
+      log('Imported', Object.keys(m));
+      log('init...');
+      await m.default();
+      log('Init done');
+      log('init_world...');
+      m.init_world(800, 600, 12345);
+      log('spawn_agent...');
+      m.spawn_agent(100, 100);
+      log('step...');
+      m.step();
+      log('step done');
+      log('heatmap', m.get_heatmap_state());
+      log('agents', m.get_agents_state());
+      log('SUCCESS - WASM works!');
+    } catch(e) {
+      log('ERROR:', e.message + ' | ' + e.stack);
+    }
+  </script>
+</body></html>

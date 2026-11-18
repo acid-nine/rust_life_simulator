@@ -85,12 +85,14 @@
                 <button id="spawnFood">Spawn Food</button>
                 <div style="margin-top: 4px;">
                     <label for="speedSlider">Sim Speed:</label>
-                    <input type="range" id="speedSlider" min="1" max="10" value="1">
+                    <input type="range" id="speedSlider" min="0.01" max="10" step="0.01" value="1">
+                    <span id="speedVal" style="font-size:12px;">1.00x</span>
                 </div>
             </div>
         </div>
         <div id="canvasArea" style="position:relative;">
-            <canvas id="heatCanvas" style="position:absolute;top:0;left:0;z-index:1;pointer-events:none;opacity:0.5;"></canvas>
+            <div id="loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:24px;z-index:999;">Loading...</div>
+            <canvas id="heatCanvas" style="position:absolute;top:0;left:0;z-index:1;pointer-events:none;"></canvas>
             <canvas id="simCanvas"></canvas>
         </div>
     </div>
@@ -106,10 +108,12 @@
             get_grasslands_state,
             get_world_time,
             get_heatmap_state,
+            get_pop_stats,
         } from './pkg/rust_life_sim.js';
 
         const W = 800, H = 600;
         let simSpeed = 1;
+        let stepAccumulator = 0;
         let paused = false;
         let hist = [];
         let selectedId = null;
@@ -133,17 +137,36 @@
             init_world(W, H, newSeed());
             for (let i = 0; i < 20; i++) spawn_agent(Math.random() * W, Math.random() * H);
             for (let i = 0; i < 15; i++) spawn_food();
-            heatCtx.clearRect(0, 0, W, H);
+            const _heatCanvas = document.getElementById('heatCanvas');
+            if (_heatCanvas) {
+                const _heatCtx = _heatCanvas.getContext('2d');
+                _heatCtx.clearRect(0, 0, W, H);
+            }
             hist = [];
+            stepAccumulator = 0;
             selectedId = null;
         }
 
         async function run() {
-            await init();
+            try {
+                await init();
+            } catch(e) {
+                const loadingEl = document.getElementById('loading');
+                if (loadingEl) {
+                    loadingEl.style.display = 'block';
+                    loadingEl.textContent = 'WASM INIT ERROR: ' + e.message;
+                    loadingEl.style.color = '#f44';
+                    loadingEl.style.fontSize = '16px';
+                }
+                console.error('WASM init failed', e);
+                return;
+            }
 
             const canvas = document.getElementById('simCanvas');
             canvas.width = W;
             canvas.height = H;
+            const loadingEl = document.getElementById('loading');
+            if (loadingEl) loadingEl.style.display = 'none';
             const ctx = canvas.getContext('2d');
 
             const popChartCanvas = document.getElementById('popChart');
@@ -198,9 +221,13 @@
                 const grasslands = JSON.parse(get_grasslands_state());
                 const time = get_world_time();
                 const isNight = (time % 2000) > 1000;
+                const popStats = JSON.parse(get_pop_stats());
+                // Season sky color
+                const seasonColors = ['#000022', '#000033', '#1a0a00', '#222244']; // spring, summer, autumn, winter
+                const skyColor = seasonColors[popStats.season] || '#000033';
 
                 ctx.clearRect(0, 0, W, H);
-                ctx.fillStyle = isNight ? '#000033' : '#000';
+                ctx.fillStyle = isNight ? skyColor : '#000';
                 ctx.fillRect(0, 0, W, H);
 
                 const cam = getCam(agents);
@@ -256,7 +283,7 @@
                 }
                 ctx.restore();
 
-                // Heatmap overlay: blue (births) / red (deaths), scaled 1 cell = 10px.
+                // Heatmap overlay: green (low) → yellow (mid) → red (high).
                 if (document.getElementById('heatChk').checked) {
                     const data = get_heatmap_state();
                     const CELL = 10;
@@ -265,13 +292,22 @@
                         for (let i = 0; i < 80; i++) {
                             const v = data[j * 80 + i];
                             if (v > 0) {
-                                // Value 1-25: green-to-yellow/red gradient
-                                // Value 26-50: red-to-white
-                                const t = v / 50;
-                                const r = Math.min(255, t * 2 * 255) | 0;
-                                const g = (255 - Math.abs(t * 2 - 1) * 255) | 0;
-                                const b = (255 - t * 2 * 255) | 0;
-                                const a = Math.min(0.6, t * 0.6);
+                                const t = Math.min(1, v / 40);
+                                let r, g, b;
+                                if (t < 0.5) {
+                                    // green → yellow
+                                    const s = t * 2;
+                                    r = (s * 255) | 0;
+                                    g = 255;
+                                    b = (s * 100) | 0;
+                                } else {
+                                    // yellow → red
+                                    const s = (t - 0.5) * 2;
+                                    r = 255;
+                                    g = (255 * (1 - s)) | 0;
+                                    b = 0;
+                                }
+                                const a = (0.5 + t * 0.4).toFixed(2);
                                 heatCtx.fillStyle = `rgba(${r},${g},${b},${a})`;
                                 heatCtx.fillRect(i * CELL, j * CELL, CELL, CELL);
                             }
@@ -282,9 +318,9 @@
                 const preyE = avg(agents.filter(a => a.species === 0), 'energy');
                 const predE = avg(agents.filter(a => a.species === 1), 'energy');
                 document.getElementById('stats').textContent =
-                    `Time: ${time} | ${isNight ? 'NIGHT' : 'DAY'} | Pop: ${agents.length} (Prey: ${prey} | Pred: ${pred}) | food ${food.length} | ` +
+                    `Time: ${time} | ${isNight ? 'NIGHT' : 'DAY'} | Season: ${popStats.season} | Pop: ${agents.length} (Prey: ${prey} | Pred: ${pred}) | food ${food.length} | ` +
                     `speed ${avg(agents, 'speed').toFixed(2)} size ${avg(agents, 'size').toFixed(2)} sense ${avg(agents, 'sense').toFixed(2)} | ` +
-                    `energy P:${preyE.toFixed(0)} R:${predE.toFixed(0)}`;
+                    `energy P:${preyE.toFixed(0)} R:${predE.toFixed(0)} | Births: ${popStats.births} Deaths: ${popStats.deaths}`;
 
                 drawLines(popCtx, popChartCanvas.width, popChartCanvas.height, [
                     { data: hist.map(h => h.prey), color: '#0f0', max: 200 },
@@ -313,7 +349,7 @@
             }
 
             const speedSlider = document.getElementById('speedSlider');
-            speedSlider.oninput = (e) => { simSpeed = parseInt(e.target.value); };
+            speedSlider.oninput = (e) => { simSpeed = parseFloat(e.target.value); document.getElementById('speedVal').textContent = simSpeed.toFixed(2) + 'x'; };
             const pauseBtn = document.getElementById('pauseBtn');
             pauseBtn.onclick = () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; };
             document.getElementById('stepBtn').onclick = () => { step(); render(); };
@@ -324,11 +360,27 @@
             resetWorld();
 
             function loop() {
-                if (!paused) { for (let i = 0; i < simSpeed; i++) step(); }
+                if (!paused) {
+                    stepAccumulator += simSpeed;
+                    while (stepAccumulator >= 1) { step(); stepAccumulator -= 1; }
+                }
                 render();
                 requestAnimationFrame(loop);
             }
             loop();
+
+            // Catch unhandled errors
+            window.onerror = (msg, url, line, col, err) => {
+                const loadingEl = document.getElementById('loading');
+                if (loadingEl) {
+                    loadingEl.style.display = 'block';
+                    loadingEl.textContent = 'ERROR: ' + msg + ' (line ' + line + ')';
+                    loadingEl.style.color = '#f44';
+                    loadingEl.style.fontSize = '16px';
+                }
+                console.error(msg, err);
+                return false;
+            };
 
             canvas.onclick = (e) => {
                 const rect = canvas.getBoundingClientRect();
