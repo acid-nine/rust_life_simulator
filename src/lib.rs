@@ -3,17 +3,17 @@ use std::f32::consts::PI;
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
-const MAX_FOOD: usize = 300;
-const MAX_AGENTS: usize = 500;
+const MAX_FOOD: usize = 200;
+const MAX_AGENTS: usize = 300;
 const FOOD_ENERGY: f32 = 40.0;
 // Per-food lifetime in ticks. Carcasses rot faster than grown food.
 const FOOD_TTL: u32 = 400;
 const CARCASS_TTL: u32 = 150;
 
-// Agent energy economy: starting energy, metabolism scale, reproduction threshold
-const AGENT_START_ENERGY: f32 = 200.0;
-const METABOLISM_SCALE: f32 = 0.001; // was 0.05 base + 0.01*speed^2*size
-const REPRO_THRESHOLD_BASE: f32 = 180.0;
+// Agent energy economy
+const AGENT_START_ENERGY: f32 = 100.0;
+const METABOLISM_BASE: f32 = 0.008; // base energy burn per tick for speed=1.0, size=1.0, sense=0
+const REPRO_THRESHOLD_BASE: f32 = 120.0;
 
 // Heatmap: 80×60 grid (one cell = 10×10 world pixels). Max value 50, decays 1/tick.
 const HEAT_W: usize = 80;
@@ -148,14 +148,14 @@ pub fn init_world(width: f32, height: f32, seed: u32) {
         agents: Vec::new(),
         food: Vec::new(),
         walls: vec![
-            Rect { x: 200.0, y: 100.0, w: 50.0, h: 300.0 },
-            Rect { x: 400.0, y: 300.0, w: 200.0, h: 50.0 },
-            Rect { x: 100.0, y: 400.0, w: 100.0, h: 100.0 },
+            Rect { x: 150.0, y: 80.0, w: 40.0, h: 200.0 },
+            Rect { x: 280.0, y: 180.0, w: 60.0, h: 40.0 },
+            Rect { x: 80.0, y: 220.0, w: 50.0, h: 50.0 },
         ],
         grasslands: vec![
             Grassland { x: 100.0, y: 100.0, radius: 100.0, regrow_timer: 0 },
-            Grassland { x: 500.0, y: 400.0, radius: 150.0, regrow_timer: 0 },
-            Grassland { x: 600.0, y: 100.0, radius: 80.0, regrow_timer: 0 },
+            Grassland { x: 300.0, y: 200.0, radius: 100.0, regrow_timer: 0 },
+            Grassland { x: 150.0, y: 250.0, radius: 80.0, regrow_timer: 0 },
         ],
         time: 0,
         rng: seed.max(1),
@@ -169,13 +169,18 @@ pub fn init_world(width: f32, height: f32, seed: u32) {
     with_world(|w| {
         let grasslands: Vec<(f32, f32, f32)> = w.grasslands.iter().map(|g| (g.x, g.y, g.radius)).collect();
         for (gx, gy, gr) in grasslands {
-            for _ in 0..8 {
+            for _ in 0..5 {
                 let p = Point {
                     x: gx + (w.rand() - 0.5) * (gr * 0.8),
                     y: gy + (w.rand() - 0.5) * (gr * 0.8),
                 };
                 w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
             }
+        }
+        // Scatter some random food.
+        for _ in 0..20 {
+            let p = Point { x: w.rand() * w.width, y: w.rand() * w.height };
+            w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
         }
     });
 }
@@ -255,9 +260,10 @@ pub fn step() {
             // Metabolism: fast, big, far-sighted agents burn more.
             let night = (w.time % 2000) > 1000;
             let current_sense = if night { a.sense * 0.5 } else { a.sense };
-            // Quadratic cost for speed+size, linear for sense; halved by metabolism_eff
-            let metabolism = (METABOLISM_SCALE * a.speed * a.speed * a.size + 0.0003 * current_sense) * (1.0 - a.metabolism_eff) * season_metab;
-            a.energy -= metabolism.max(0.0);
+            // metabolism_eff *is* the efficiency of energy use:
+            // high eff = burns more per tick but eats more effectively
+            let base_cost = METABOLISM_BASE * a.speed * a.speed * a.size + 0.001 * current_sense;
+            a.energy -= base_cost * a.metabolism_eff * season_metab;
             
             if a.species == 0 {
                 // Prey: Find nearest food within sense range.
@@ -273,10 +279,10 @@ pub fn step() {
                     Some((j, d2)) if d2.sqrt() <= a.size + 3.0 => {
                         let f = &w.food[j];
                         match f.f_type {
-                            FoodType::Normal => a.energy += FOOD_ENERGY,
-                            FoodType::HighEnergy => a.energy += FOOD_ENERGY * 2.0,
-                            FoodType::Poisonous => a.energy -= FOOD_ENERGY * 1.5,
-                            FoodType::Carcass => a.energy += FOOD_ENERGY * 2.5,
+                            FoodType::Normal => a.energy += FOOD_ENERGY * a.metabolism_eff,
+                            FoodType::HighEnergy => a.energy += FOOD_ENERGY * 2.0 * a.metabolism_eff,
+                            FoodType::Poisonous => a.energy -= FOOD_ENERGY * 1.5 / a.metabolism_eff,
+                            FoodType::Carcass => a.energy += FOOD_ENERGY * 2.5 * a.metabolism_eff,
                         }
                         w.food.swap_remove(j);
                     }
@@ -384,24 +390,26 @@ pub fn step() {
                 a.y = a.y.clamp(0.0, w.height);
             }
             
-            // Reproduce: split energy with a mutated child.
+            // Reproduce: split energy with a mutated child (parent keeps 2/3).
             if a.energy > a.repro_threshold && n + babies.len() < MAX_AGENTS {
-                a.energy /= 2.0;
+                let child_energy = a.energy * 0.3;
+                a.energy -= child_energy;
                 // Stress-induced mutation: agents near death mutate more (evolutionary pressure).
                 let stress = if a.energy > 0.0 { (a.repro_threshold - a.energy) / a.repro_threshold } else { 0.0 };
-                let child = Agent {
+                let mut child = Agent {
                     id: w.next_id,
                     heading: w.rand() * 2.0 * PI,
                     speed: w.mutate_stress(a.speed, 0.3, 5.0, stress),
                     size: w.mutate_stress(a.size, 1.0, 10.0, stress),
                     sense: w.mutate_stress(a.sense, 10.0, 200.0, stress),
                     species: a.species,
-                    repro_threshold: w.mutate_stress(a.repro_threshold, 100.0, 250.0, stress),
-                    metabolism_eff: w.mutate_stress(a.metabolism_eff, 0.5, 1.0, stress),
+                    repro_threshold: w.mutate_stress(a.repro_threshold, 80.0, 200.0, stress),
+                    metabolism_eff: w.mutate_stress(a.metabolism_eff, 0.5, 1.5, stress),
                     age: 0,
                     generation: a.generation + 1,
                     ..a.clone()
                 };
+                child.energy = child_energy;
                 w.next_id += 1;
                 w.record_heatmap(child.x, child.y, false);
                 w.total_births += 1;
@@ -466,16 +474,6 @@ pub fn step() {
         }
         w.agents = survivors;
         w.agents.extend(babies);
-
-        // Ensure world starts with enough food.
-        if w.time == 0 {
-            let mut spawned = 0;
-            while w.food.len() < 80 && spawned < 200 {
-                let p = Point { x: w.rand() * w.width, y: w.rand() * w.height };
-                w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
-                spawned += 1;
-            }
-        }
     });
 }
 

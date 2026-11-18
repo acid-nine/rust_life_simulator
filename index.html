@@ -111,7 +111,7 @@
             get_pop_stats,
         } from './pkg/rust_life_sim.js';
 
-        const W = 800, H = 600;
+        const W = 400, H = 300;
         let simSpeed = 1;
         let stepAccumulator = 0;
         let paused = false;
@@ -135,8 +135,8 @@
 
         function resetWorld() {
             init_world(W, H, newSeed());
-            for (let i = 0; i < 20; i++) spawn_agent(Math.random() * W, Math.random() * H);
-            for (let i = 0; i < 15; i++) spawn_food();
+            for (let i = 0; i < 40; i++) spawn_agent(Math.random() * W, Math.random() * H);
+            for (let i = 0; i < 30; i++) spawn_food();
             const _heatCanvas = document.getElementById('heatCanvas');
             if (_heatCanvas) {
                 const _heatCtx = _heatCanvas.getContext('2d');
