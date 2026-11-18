@@ -11,7 +11,7 @@ const FOOD_TTL: u32 = 400;
 const CARCASS_TTL: u32 = 150;
 
 // Agent energy economy
-const AGENT_START_ENERGY: f32 = 200.0;
+const AGENT_START_ENERGY: f32 = 80.0;
 const METABOLISM_BASE: f32 = 0.001; // base energy burn per tick for speed=1.0, size=1.0, sense=0
 const REPRO_THRESHOLD_BASE: f32 = 120.0;
 
