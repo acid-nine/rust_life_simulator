@@ -1,0 +1,11 @@
+# Rust Life Sim
+# Evolutionary simulation engine compiled to Wasm.
+
+# Ignore build artifacts
+/target/
+# Ignore system files
+.DS_Store
+Thumbs.db
+# Ignore IDE files
+.vscode/
+.idea/

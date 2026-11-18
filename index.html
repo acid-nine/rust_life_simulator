@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Evolutionary Life Sim</title>
+    <style>
+        body {
+            margin: 0;
+            background: #1a1a1a;
+            overflow: hidden;
+            display: flex;
+            flex-direction: row;
+            justify-content: flex-start;
+            align-items: stretch;
+            height: 100vh;
+            color: white;
+            font-family: sans-serif;
+        }
+        #sidebar {
+            width: 300px;
+            background: #2a2a2a;
+            border-right: 1px solid #444;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .container {
+            display: flex;
+            flex: 1;
+            padding: 10px;
+            gap: 10px;
+        }
+        canvas {
+            background: #000;
+            border: 1px solid #333;
+        }
+        #controls {
+            margin-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        #controls button {
+            padding: 4px;
+            cursor: pointer;
+        }
+        .chart-container {
+            height: 100px;
+            width: 260px;
+            background: #000;
+        }
+        .chart-label {
+            font-size: 11px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="sidebar">
+            <h2>Agent Info</h2>
+            <div id="selectedAgentData" style="font-size: 12px;">Click an agent to see data.</div>
+            <hr style="border: 0.5px solid #444;">
+            <h2>Stats</h2>
+            <div id="stats" style="color:#ccc;font:12px monospace;"></div>
+            <h2>Charts</h2>
+            <div class="chart-label">Population (green prey / red predator)</div>
+            <canvas id="popChart" class="chart-container"></canvas>
+            <div class="chart-label">Avg genes (cyan speed / yellow size / magenta sense)</div>
+            <canvas id="geneChart" class="chart-container"></canvas>
+            <div class="chart-label">Age histogram of current agents</div>
+            <canvas id="ageChart" class="chart-container"></canvas>
+            <div id="controls" style="margin-top: auto;">
+                <button id="pauseBtn">Pause</button>
+                <button id="stepBtn">Step</button>
+                <button id="resetBtn">Reset</button>
+                <label style="font-size: 12px;"><input type="checkbox" id="followChk"> Follow selected</label>
+                <label style="font-size: 12px;"><input type="checkbox" id="senseChk"> Show sensing</label>
+                <button id="spawnAgent">Spawn Agent</button>
+                <button id="spawnFood">Spawn Food</button>
+                <div style="margin-top: 4px;">
+                    <label for="speedSlider">Sim Speed:</label>
+                    <input type="range" id="speedSlider" min="1" max="10" value="1">
+                </div>
+            </div>
+        </div>
+        <canvas id="simCanvas"></canvas>
+    </div>
+    <script type="module">
+        import init, {
+            init_world,
+            spawn_agent,
+            spawn_food,
+            step,
+            get_agents_state,
+            get_food_state,
+            get_walls_state,
+            get_grasslands_state,
+            get_world_time
+        } from './pkg/rust_life_sim.js';
+
+        const W = 800, H = 600;
+        let simSpeed = 1;
+        let paused = false;
+        let hist = [];
+        let selectedId = null;
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+        // Camera: zoomed + centered on the selected agent when "Follow selected" is on.
+        function getCam(agents) {
+            if (document.getElementById('followChk').checked && selectedId !== null) {
+                const a = agents.find(a => a.id === selectedId);
+                if (a) {
+                    const zoom = 2;
+                    return { zoom, x: clamp(a.x * zoom - W / 2, 0, W * zoom - W), y: clamp(a.y * zoom - H / 2, 0, H * zoom - H) };
+                }
+            }
+            return { zoom: 1, x: 0, y: 0 };
+        }
+
+        function newSeed() { return (Math.random() * 2 ** 32) >>> 0; }
+
+        function resetWorld() {
+            init_world(W, H, newSeed());
+            for (let i = 0; i < 20; i++) spawn_agent(Math.random() * W, Math.random() * H);
+            for (let i = 0; i < 15; i++) spawn_food();
+            hist = [];
+            selectedId = null;
+        }
+
+        async function run() {
+            await init();
+
+            const canvas = document.getElementById('simCanvas');
+            canvas.width = W;
+            canvas.height = H;
+            const ctx = canvas.getContext('2d');
+
+            const popChartCanvas = document.getElementById('popChart');
+            popChartCanvas.width = 260; popChartCanvas.height = 100;
+            const popCtx = popChartCanvas.getContext('2d');
+            const geneChartCanvas = document.getElementById('geneChart');
+            geneChartCanvas.width = 260; geneChartCanvas.height = 100;
+            const geneCtx = geneChartCanvas.getContext('2d');
+            const ageChartCanvas = document.getElementById('ageChart');
+            ageChartCanvas.width = 260; ageChartCanvas.height = 100;
+            const ageCtx = ageChartCanvas.getContext('2d');
+
+            const avg = (arr, k) => arr.length ? arr.reduce((s, a) => s + a[k], 0) / arr.length : 0;
+
+            function record() {
+                const agents = JSON.parse(get_agents_state());
+                const prey = agents.filter(a => a.species === 0).length;
+                hist.push({
+                    prey,
+                    pred: agents.length - prey,
+                    speed: avg(agents, 'speed'),
+                    size: avg(agents, 'size'),
+                    sense: avg(agents, 'sense'),
+                });
+                if (hist.length > 100) hist.shift();
+                return { agents, prey };
+            }
+
+            function drawLines(c, cw, ch, series) {
+                c.clearRect(0, 0, cw, ch);
+                for (const s of series) {
+                    c.strokeStyle = s.color;
+                    c.beginPath();
+                    for (let i = 0; i < s.data.length; i++) {
+                        const x = (i / 100) * cw;
+                        const y = ch - (s.data[i] / s.max) * ch;
+                        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+                    }
+                    c.stroke();
+                }
+            }
+
+            function render() {
+                const { agents, prey } = record();
+                const pred = agents.length - prey;
+                const food = JSON.parse(get_food_state());
+                const walls = JSON.parse(get_walls_state());
+                const grasslands = JSON.parse(get_grasslands_state());
+                const time = get_world_time();
+                const isNight = (time % 2000) > 1000;
+
+                ctx.clearRect(0, 0, W, H);
+                ctx.fillStyle = isNight ? '#000033' : '#000';
+                ctx.fillRect(0, 0, W, H);
+
+                const cam = getCam(agents);
+                ctx.save();
+                ctx.scale(cam.zoom, cam.zoom);
+                ctx.translate(-cam.x / cam.zoom, -cam.y / cam.zoom);
+
+                ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+                grasslands.forEach(g => { ctx.beginPath(); ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2); ctx.fill(); });
+                ctx.fillStyle = '#555';
+                walls.forEach(w => ctx.fillRect(w.x, w.y, w.w, w.h));
+
+                const foodColor = { Normal: '#0f0', HighEnergy: '#0ff', Poisonous: '#f00', Carcass: '#8b4513' };
+                food.forEach(f => {
+                    ctx.beginPath();
+                    ctx.arc(f.pos.x, f.pos.y, 3, 0, Math.PI * 2);
+                    ctx.fillStyle = foodColor[f.f_type] || '#0f0';
+                    ctx.fill();
+                });
+
+                agents.forEach(agent => {
+                    ctx.beginPath();
+                    ctx.arc(agent.x, agent.y, agent.size, 0, Math.PI * 2);
+                    const hue = agent.species === 1 ? 0 : 120;
+                    ctx.fillStyle = `hsl(${hue}, 90%, ${agent.energy > 50 ? 60 : 30}%)`;
+                    ctx.fill();
+                });
+
+                // Sensing viz: sense-radius circle + heading (target) line per agent.
+                if (document.getElementById('senseChk').checked) {
+                    for (const a of agents) {
+                        ctx.strokeStyle = 'rgba(120, 255, 120, 0.12)';
+                        ctx.beginPath();
+                        ctx.arc(a.x, a.y, a.sense, 0, Math.PI * 2);
+                        ctx.stroke();
+                        ctx.strokeStyle = a.species === 1 ? 'rgba(255, 80, 80, 0.5)' : 'rgba(80, 255, 80, 0.5)';
+                        ctx.beginPath();
+                        ctx.moveTo(a.x, a.y);
+                        ctx.lineTo(a.x + Math.cos(a.heading) * a.sense, a.y + Math.sin(a.heading) * a.sense);
+                        ctx.stroke();
+                    }
+                }
+
+                // Selection ring (drawn in screen space).
+                const sel = agents.find(a => a.id === selectedId);
+                if (sel) {
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(sel.x * cam.zoom - cam.x, sel.y * cam.zoom - cam.y, (sel.size + 4) * cam.zoom, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.lineWidth = 1;
+                }
+                ctx.restore();
+
+                const preyE = avg(agents.filter(a => a.species === 0), 'energy');
+                const predE = avg(agents.filter(a => a.species === 1), 'energy');
+                document.getElementById('stats').textContent =
+                    `Time: ${time} | ${isNight ? 'NIGHT' : 'DAY'} | Pop: ${agents.length} (Prey: ${prey} | Pred: ${pred}) | food ${food.length} | ` +
+                    `speed ${avg(agents, 'speed').toFixed(2)} size ${avg(agents, 'size').toFixed(2)} sense ${avg(agents, 'sense').toFixed(2)} | ` +
+                    `energy P:${preyE.toFixed(0)} R:${predE.toFixed(0)}`;
+
+                drawLines(popCtx, popChartCanvas.width, popChartCanvas.height, [
+                    { data: hist.map(h => h.prey), color: '#0f0', max: 200 },
+                    { data: hist.map(h => h.pred), color: '#f00', max: 200 },
+                ]);
+                drawLines(geneCtx, geneChartCanvas.width, geneChartCanvas.height, [
+                    { data: hist.map(h => h.speed / 5), color: '#0ff', max: 1 },
+                    { data: hist.map(h => h.size / 10), color: '#ff0', max: 1 },
+                    { data: hist.map(h => h.sense / 200), color: '#f0f', max: 1 },
+                ]);
+
+                const edges = [50, 100, 200, 400, 800, Infinity];
+                const buckets = [0, 0, 0, 0, 0, 0];
+                agents.forEach(a => {
+                    let i = edges.findIndex(e => a.age < e);
+                    buckets[i >= 0 ? i : 5]++;
+                });
+                const maxB = Math.max(1, ...buckets);
+                ageCtx.clearRect(0, 0, ageChartCanvas.width, ageChartCanvas.height);
+                ageCtx.fillStyle = '#0f0';
+                const bw = ageChartCanvas.width / 6;
+                buckets.forEach((b, i) => {
+                    const h = (b / maxB) * ageChartCanvas.height;
+                    ageCtx.fillRect(i * bw + 2, ageChartCanvas.height - h, bw - 4, h);
+                });
+            }
+
+            const speedSlider = document.getElementById('speedSlider');
+            speedSlider.oninput = (e) => { simSpeed = parseInt(e.target.value); };
+            const pauseBtn = document.getElementById('pauseBtn');
+            pauseBtn.onclick = () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; };
+            document.getElementById('stepBtn').onclick = () => { step(); render(); };
+            document.getElementById('resetBtn').onclick = () => { resetWorld(); render(); };
+
+            setInterval(() => { if (!paused) spawn_food(); }, 100);
+
+            resetWorld();
+
+            function loop() {
+                if (!paused) { for (let i = 0; i < simSpeed; i++) step(); }
+                render();
+                requestAnimationFrame(loop);
+            }
+            loop();
+
+            canvas.onclick = (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const agents = JSON.parse(get_agents_state());
+                const cam = getCam(agents);
+                const clickX = (e.clientX - rect.left + cam.x) / cam.zoom;
+                const clickY = (e.clientY - rect.top + cam.y) / cam.zoom;
+
+                let found = null;
+                for (const agent of agents) {
+                    const d2 = (agent.x - clickX) ** 2 + (agent.y - clickY) ** 2;
+                    if (d2 < (agent.size + 5) ** 2) { found = agent; break; }
+                }
+
+                if (found) {
+                    selectedId = found.id;
+                    const data = `
+                        ID: ${found.id}
+                        Species: ${found.species === 1 ? 'Predator' : 'Prey'}
+                        Energy: ${found.energy.toFixed(2)}
+                        Speed: ${found.speed.toFixed(2)}
+                        Size: ${found.size.toFixed(2)}
+                        Sense: ${found.sense.toFixed(2)}
+                        Metabolism: ${found.metabolism_eff.toFixed(2)}
+                        Repro Threshold: ${found.repro_threshold.toFixed(2)}
+                        Age: ${found.age}
+                        Lineage: ${found.lineage} (gen ${found.generation})
+                    `;
+                    document.getElementById('selectedAgentData').innerHTML = data;
+                } else {
+                    document.getElementById('selectedAgentData').textContent = 'Click an agent to see data.';
+                }
+            };
+        }
+
+        document.getElementById('spawnAgent').onclick = () => spawn_agent(Math.random() * W, Math.random() * H);
+        document.getElementById('spawnFood').onclick = () => spawn_food();
+
+        run();
+    </script>
+</body>
+</html>

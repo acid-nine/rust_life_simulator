@@ -1,0 +1,430 @@
+use serde::Serialize;
+use std::f32::consts::PI;
+use std::sync::Mutex;
+use wasm_bindgen::prelude::*;
+
+const MAX_FOOD: usize = 300;
+const MAX_AGENTS: usize = 500;
+const FOOD_ENERGY: f32 = 40.0;
+// Per-food lifetime in ticks. Carcasses rot faster than grown food.
+const FOOD_TTL: u32 = 400;
+const CARCASS_TTL: u32 = 150;
+
+#[derive(Serialize, Clone, PartialEq)]
+pub enum FoodType {
+    Normal,
+    HighEnergy,
+    Poisonous,
+    Carcass,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Agent {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub heading: f32,
+    // genes
+    pub speed: f32,
+    pub size: f32,
+    pub sense: f32,
+    pub energy: f32,
+    pub species: u8,
+    pub repro_threshold: f32,
+    pub metabolism_eff: f32,
+    pub age: u32,
+    pub lineage: u32,
+    pub generation: u32,
+}
+
+#[derive(Serialize, Clone, Copy)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Food {
+    pub pos: Point,
+    pub f_type: FoodType,
+    pub ttl: u32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Grassland {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub regrow_timer: u32,
+}
+
+pub struct World {
+    width: f32,
+    height: f32,
+    agents: Vec<Agent>,
+    food: Vec<Food>,
+    walls: Vec<Rect>,
+    grasslands: Vec<Grassland>,
+    time: u32,
+    rng: u32,
+    next_id: u32,
+}
+
+impl World {
+    /// xorshift32 -> [0, 1)
+    fn rand(&mut self) -> f32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        (x >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    fn mutate(&mut self, v: f32, lo: f32, hi: f32) -> f32 {
+        (v * (1.0 + (self.rand() - 0.5) * 0.2)).clamp(lo, hi)
+    }
+}
+
+static WORLD: Mutex<Option<World>> = Mutex::new(None);
+
+fn with_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R> {
+    WORLD.lock().unwrap().as_mut().map(f)
+}
+
+#[wasm_bindgen]
+pub fn init_world(width: f32, height: f32, seed: u32) {
+    *WORLD.lock().unwrap() = Some(World {
+        width,
+        height,
+        agents: Vec::new(),
+        food: Vec::new(),
+        walls: vec![
+            Rect { x: 200.0, y: 100.0, w: 50.0, h: 300.0 },
+            Rect { x: 400.0, y: 300.0, w: 200.0, h: 50.0 },
+            Rect { x: 100.0, y: 400.0, w: 100.0, h: 100.0 },
+        ],
+        grasslands: vec![
+            Grassland { x: 100.0, y: 100.0, radius: 100.0, regrow_timer: 0 },
+            Grassland { x: 500.0, y: 400.0, radius: 150.0, regrow_timer: 0 },
+            Grassland { x: 600.0, y: 100.0, radius: 80.0, regrow_timer: 0 },
+        ],
+        time: 0,
+        rng: seed.max(1), // xorshift must not start at 0
+        next_id: 1,
+    });
+}
+
+#[wasm_bindgen]
+pub fn spawn_agent(x: f32, y: f32) {
+    with_world(|w| {
+        let agent = Agent {
+            id: w.next_id,
+            x,
+            y,
+            heading: w.rand() * 2.0 * PI,
+            speed: 1.0 + w.rand(),
+            size: 2.0 + w.rand() * 2.0,
+            sense: 40.0 + w.rand() * 40.0,
+            energy: 100.0,
+            species: if w.rand() > 0.9 { 1 } else { 0 },
+            repro_threshold: 150.0 + w.rand() * 50.0,
+            metabolism_eff: 0.8 + w.rand() * 0.4,
+            age: 0,
+            lineage: w.next_id,
+            generation: 0,
+        };
+        w.next_id += 1;
+        w.agents.push(agent);
+    });
+}
+
+#[wasm_bindgen]
+pub fn spawn_food() {
+    with_world(|w| {
+        if w.food.len() < MAX_FOOD {
+            let f_type = match w.rand() {
+                r if r < 0.1 => FoodType::Poisonous,
+                r if r < 0.3 => FoodType::HighEnergy,
+                _ => FoodType::Normal,
+            };
+            let p = Point { x: w.rand() * w.width, y: w.rand() * w.height };
+            w.food.push(Food { pos: p, f_type, ttl: FOOD_TTL });
+        }
+    });
+}
+
+#[wasm_bindgen]
+pub fn step() {
+    with_world(|w| {
+        // Decay existing food; pruned before agents act so new food isn't touched this tick.
+        for f in &mut w.food {
+            if f.ttl > 0 {
+                f.ttl -= 1;
+            }
+        }
+        w.food.retain(|f| f.ttl > 0);
+
+        let n = w.agents.len();
+        let mut babies = Vec::new();
+
+        for i in 0..n {
+            let mut a = w.agents[i].clone();
+            a.age += 1;
+            
+            // Metabolism: fast, big, far-sighted agents burn more.
+            let night = (w.time % 2000) > 1000;
+            let current_sense = if night { a.sense * 0.5 } else { a.sense };
+            a.energy -= (0.05 + 0.01 * a.speed * a.speed * a.size + 0.001 * current_sense) * (1.0 - a.metabolism_eff);
+            
+            if a.species == 0 {
+                // Prey: Find nearest food within sense range.
+                let mut best: Option<(usize, f32)> = None;
+                for (j, f) in w.food.iter().enumerate() {
+                    let d2 = (f.pos.x - a.x).powi(2) + (f.pos.y - a.y).powi(2);
+                    if d2 < current_sense * current_sense && best.is_none_or(|(_, b)| d2 < b) {
+                        best = Some((j, d2));
+                    }
+                }
+                
+                match best {
+                    Some((j, d2)) if d2.sqrt() <= a.size + 3.0 => {
+                        let f = &w.food[j];
+                        match f.f_type {
+                            FoodType::Normal => a.energy += FOOD_ENERGY,
+                            FoodType::HighEnergy => a.energy += FOOD_ENERGY * 2.0,
+                            FoodType::Poisonous => a.energy -= FOOD_ENERGY * 1.5,
+                            FoodType::Carcass => a.energy += FOOD_ENERGY * 2.5,
+                        }
+                        w.food.swap_remove(j);
+                    }
+                    Some((j, _)) => {
+                        let f = &w.food[j];
+                        a.heading = (f.pos.y - a.y).atan2(f.pos.x - a.x);
+                    }
+                    None => a.heading += (w.rand() - 0.5) * 0.6,
+                }
+            } else {
+                // Predator: Find nearest prey (species 0) within sense range.
+                let mut best_prey: Option<(usize, f32)> = None;
+                for (j, other) in w.agents.iter().enumerate() {
+                    if other.species == 0 {
+                        let d2 = (other.x - a.x).powi(2) + (other.y - a.y).powi(2);
+                        if d2 < current_sense * current_sense && best_prey.is_none_or(|(_, b)| d2 < b) {
+                            best_prey = Some((j, d2));
+                        }
+                    }
+                }
+                
+                match best_prey {
+                    Some((j, d2)) if d2.sqrt() <= a.size + 5.0 => {
+                        w.agents[j].energy = 0.0;
+                        a.energy += FOOD_ENERGY * 1.5;
+                    }
+                    Some((j, _)) => {
+                        let prey = &w.agents[j];
+                        a.heading = (prey.y - a.y).atan2(prey.x - a.x);
+                    }
+                    None => {
+                        // Fallback: no prey nearby, scavenge the nearest carcass.
+                        let mut carcass: Option<(usize, f32)> = None;
+                        for (j, f) in w.food.iter().enumerate() {
+                            if f.f_type == FoodType::Carcass {
+                                let d2 = (f.pos.x - a.x).powi(2) + (f.pos.y - a.y).powi(2);
+                                if d2 < current_sense * current_sense && carcass.is_none_or(|(_, b)| d2 < b) {
+                                    carcass = Some((j, d2));
+                                }
+                            }
+                        }
+                        match carcass {
+                            Some((j, d2)) if d2.sqrt() <= a.size + 3.0 => {
+                                a.energy += FOOD_ENERGY * 2.5;
+                                w.food.swap_remove(j);
+                            }
+                            Some((j, _)) => {
+                                let c = &w.food[j];
+                                a.heading = (c.pos.y - a.y).atan2(c.pos.x - a.x);
+                            }
+                            None => a.heading += (w.rand() - 0.5) * 0.6,
+                        }
+                    }
+                }
+            }
+            
+            a.x += a.heading.cos() * a.speed;
+            a.y += a.heading.sin() * a.speed;
+            
+            // Wall Collision and Avoidance
+            for wall in &w.walls {
+                // If inside wall, push out
+                if a.x > wall.x && a.x < wall.x + wall.w && a.y > wall.y && a.y < wall.y + wall.h {
+                    let dx1 = a.x - wall.x;
+                    let dx2 = (wall.x + wall.w) - a.x;
+                    let dy1 = a.y - wall.y;
+                    let dy2 = (wall.y + wall.h) - a.y;
+                    let min_dist = dx1.min(dx2).min(dy1).min(dy2);
+                    
+                    if min_dist == dx1 { a.x -= dx1; }
+                    else if min_dist == dx2 { a.x += dx2; }
+                    else if min_dist == dy1 { a.y -= dy1; }
+                    else { a.y += dy2; }
+                }
+                
+                // If about to enter wall, rotate heading
+                let next_x = a.x + a.heading.cos() * a.speed;
+                let next_y = a.y + a.heading.sin() * a.speed;
+                if next_x > wall.x && next_x < wall.x + wall.w && next_y > wall.y && next_y < wall.y + wall.h {
+                    a.heading += 0.5; // Simple turn
+                }
+            }
+            
+            // Bounce off screen bounds.
+            if a.x < 0.0 || a.x > w.width {
+                a.heading = PI - a.heading;
+                a.x = a.x.clamp(0.0, w.width);
+            }
+            if a.y < 0.0 || a.y > w.height {
+                a.heading = -a.heading;
+                a.y = a.y.clamp(0.0, w.height);
+            }
+            
+            // Reproduce: split energy with a mutated child.
+            if a.energy > a.repro_threshold && n + babies.len() < MAX_AGENTS {
+                a.energy /= 2.0;
+                let child = Agent {
+                    id: w.next_id,
+                    heading: w.rand() * 2.0 * PI,
+                    speed: w.mutate(a.speed, 0.3, 5.0),
+                    size: w.mutate(a.size, 1.0, 10.0),
+                    sense: w.mutate(a.sense, 10.0, 200.0),
+                    species: a.species,
+                    repro_threshold: w.mutate(a.repro_threshold, 100.0, 250.0),
+                    metabolism_eff: w.mutate(a.metabolism_eff, 0.5, 1.0),
+                    age: 0,
+                    generation: a.generation + 1,
+                    ..a.clone()
+                };
+                w.next_id += 1;
+                babies.push(child);
+            }
+            
+            w.agents[i] = a;
+        }
+        
+        // Index-based so a &mut borrow of grasslands is never held across w.rand()/w.food.
+        for gi in 0..w.grasslands.len() {
+            let resting = w.grasslands[gi].regrow_timer > 0;
+            let should_spawn = !resting && w.food.iter().filter(|f| {
+                let d2 = (f.pos.x - w.grasslands[gi].x).powi(2) + (f.pos.y - w.grasslands[gi].y).powi(2);
+                d2 < w.grasslands[gi].radius * w.grasslands[gi].radius
+            }).count() < 10;
+
+            if resting {
+                w.grasslands[gi].regrow_timer -= 1;
+            } else if should_spawn {
+                let (gx, gy, gr) = (w.grasslands[gi].x, w.grasslands[gi].y, w.grasslands[gi].radius);
+                let p = Point {
+                    x: gx + (w.rand() - 0.5) * (gr * 0.8),
+                    y: gy + (w.rand() - 0.5) * (gr * 0.8),
+                };
+                w.food.push(Food { pos: p, f_type: FoodType::Normal, ttl: FOOD_TTL });
+            } else {
+                w.grasslands[gi].regrow_timer = 100;
+            }
+        }
+        
+        w.time = (w.time + 1) % 2000;
+
+        // Dead agents become carcasses, closing the food chain (prey -> food).
+        let mut survivors = Vec::with_capacity(w.agents.len());
+        for a in w.agents.drain(..) {
+            if a.energy > 0.0 {
+                survivors.push(a);
+            } else if w.food.len() < MAX_FOOD {
+                w.food.push(Food { pos: Point { x: a.x, y: a.y }, f_type: FoodType::Carcass, ttl: CARCASS_TTL });
+            }
+        }
+        w.agents = survivors;
+        w.agents.extend(babies);
+    });
+}
+
+#[wasm_bindgen]
+pub fn get_agents_state() -> String {
+    with_world(|w| serde_json::to_string(&w.agents).ok())
+        .flatten()
+        .unwrap_or_else(|| "[]".into())
+}
+
+#[wasm_bindgen]
+pub fn get_food_state() -> String {
+    with_world(|w| serde_json::to_string(&w.food).ok())
+        .flatten()
+        .unwrap_or_else(|| "[]".into())
+}
+
+#[wasm_bindgen]
+pub fn get_walls_state() -> String {
+    with_world(|w| serde_json::to_string(&w.walls).ok())
+        .flatten()
+        .unwrap_or_else(|| "[]".into())
+}
+
+#[wasm_bindgen]
+pub fn get_grasslands_state() -> String {
+    with_world(|w| serde_json::to_string(&w.grasslands).ok())
+        .flatten()
+        .unwrap_or_else(|| "[]".into())
+}
+
+#[wasm_bindgen]
+pub fn get_world_time() -> u32 {
+    with_world(|w| w.time)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent(energy: f32) -> Agent {
+        Agent {
+            id: 999, x: 10.0, y: 10.0, heading: 0.0,
+            speed: 1.0, size: 2.0, sense: 50.0, energy,
+            species: 0, repro_threshold: 200.0, metabolism_eff: 1.0, age: 0,
+            lineage: 999, generation: 0,
+        }
+    }
+
+    #[test]
+    fn food_decays_over_time() {
+        init_world(800.0, 600.0, 777);
+        with_world(|w| w.food.push(Food {
+            pos: Point { x: 5.0, y: 5.0 },
+            f_type: FoodType::Normal,
+            ttl: 1,
+        }));
+        step();
+        let still_there = with_world(|w| w.food.iter().any(|f| f.pos.x == 5.0 && f.pos.y == 5.0 && f.ttl == 1)).unwrap();
+        assert!(!still_there, "a ttl=1 food item should be pruned after one step");
+    }
+
+    #[test]
+    fn dead_agent_drops_carcass() {
+        init_world(800.0, 600.0, 12345);
+        with_world(|w| w.agents.push(test_agent(0.0)));
+        step();
+        let carcass = with_world(|w| w.food.iter().any(|f| f.f_type == FoodType::Carcass)).unwrap();
+        assert!(carcass, "a dead agent should leave a carcass");
+        let all_alive = with_world(|w| w.agents.iter().all(|a| a.energy > 0.0)).unwrap();
+        assert!(all_alive, "dead agents must be removed");
+    }
+}
