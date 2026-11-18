@@ -10,6 +10,11 @@ const FOOD_ENERGY: f32 = 40.0;
 const FOOD_TTL: u32 = 400;
 const CARCASS_TTL: u32 = 150;
 
+// Heatmap: 80×60 grid (one cell = 10×10 world pixels). Max value 50, decays 1/tick.
+const HEAT_W: usize = 80;
+const HEAT_H: usize = 60;
+type Heatmap = [f32; HEAT_W * HEAT_H];
+
 #[derive(Serialize, Clone, PartialEq)]
 pub enum FoodType {
     Normal,
@@ -76,6 +81,7 @@ pub struct World {
     time: u32,
     rng: u32,
     next_id: u32,
+    heatmap: Heatmap,
 }
 
 impl World {
@@ -91,6 +97,28 @@ impl World {
 
     fn mutate(&mut self, v: f32, lo: f32, hi: f32) -> f32 {
         (v * (1.0 + (self.rand() - 0.5) * 0.2)).clamp(lo, hi)
+    }
+
+    /// Fade heatmap toward zero.
+    fn decay_heatmap(&mut self) {
+        for v in &mut self.heatmap {
+            if *v > 0.0 {
+                *v -= 1.0;
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Record a birth or death at world coordinates (x, y).
+    fn record_heatmap(&mut self, x: f32, y: f32, _is_death: bool) {
+        let ci = (x / 10.0).floor() as usize;
+        let cj = (y / 10.0).floor() as usize;
+        if ci < HEAT_W && cj < HEAT_H {
+            let idx = cj * HEAT_W + ci;
+            self.heatmap[idx] = (self.heatmap[idx] + 1.0).min(50.0);
+        }
     }
 }
 
@@ -120,6 +148,7 @@ pub fn init_world(width: f32, height: f32, seed: u32) {
         time: 0,
         rng: seed.max(1), // xorshift must not start at 0
         next_id: 1,
+        heatmap: [0.0; HEAT_W * HEAT_H],
     });
 }
 
@@ -172,6 +201,9 @@ pub fn step() {
             }
         }
         w.food.retain(|f| f.ttl > 0);
+
+        // Fade heatmap toward zero.
+        w.decay_heatmap();
 
         let n = w.agents.len();
         let mut babies = Vec::new();
@@ -313,6 +345,7 @@ pub fn step() {
                     ..a.clone()
                 };
                 w.next_id += 1;
+                w.record_heatmap(child.x, child.y, false);
                 babies.push(child);
             }
             
@@ -345,12 +378,20 @@ pub fn step() {
 
         // Dead agents become carcasses, closing the food chain (prey -> food).
         let mut survivors = Vec::with_capacity(w.agents.len());
+        let mut deaths = Vec::new(); // positions of dead agents
         for a in w.agents.drain(..) {
             if a.energy > 0.0 {
                 survivors.push(a);
-            } else if w.food.len() < MAX_FOOD {
-                w.food.push(Food { pos: Point { x: a.x, y: a.y }, f_type: FoodType::Carcass, ttl: CARCASS_TTL });
+            } else {
+                deaths.push((a.x, a.y));
+                if w.food.len() < MAX_FOOD {
+                    w.food.push(Food { pos: Point { x: a.x, y: a.y }, f_type: FoodType::Carcass, ttl: CARCASS_TTL });
+                }
             }
+        }
+        // Record deaths after drain completes (avoids double-mutable-borrow).
+        for (dx, dy) in deaths {
+            w.record_heatmap(dx, dy, true);
         }
         w.agents = survivors;
         w.agents.extend(babies);
@@ -389,6 +430,12 @@ pub fn get_grasslands_state() -> String {
 pub fn get_world_time() -> u32 {
     with_world(|w| w.time)
         .unwrap_or(0)
+}
+
+#[wasm_bindgen]
+pub fn get_heatmap_state() -> Vec<f32> {
+    with_world(|w| w.heatmap.to_vec())
+        .unwrap_or_else(|| vec![0.0; HEAT_W * HEAT_H])
 }
 
 #[cfg(test)]
