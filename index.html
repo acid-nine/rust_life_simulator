@@ -135,8 +135,14 @@
 
         function resetWorld() {
             init_world(W, H, newSeed());
-            for (let i = 0; i < 40; i++) spawn_agent(Math.random() * W, Math.random() * H);
-            for (let i = 0; i < 30; i++) spawn_food();
+            console.log('resetWorld: spawning 60 agents and 80 food items');
+            for (let i = 0; i < 60; i++) spawn_agent(Math.random() * W, Math.random() * H);
+            for (let i = 0; i < 80; i++) spawn_food();
+            const foodAfter = JSON.parse(get_food_state());
+            console.log('resetWorld: food spawned =', foodAfter.length);
+            const agentsAfter = JSON.parse(get_agents_state());
+            console.log('resetWorld: agents spawned =', agentsAfter.length);
+            console.log('resetWorld: agents are prey:', agentsAfter.filter(a => a.species === 0).length, 'predators:', agentsAfter.filter(a => a.species === 1).length);
             const _heatCanvas = document.getElementById('heatCanvas');
             if (_heatCanvas) {
                 const _heatCtx = _heatCanvas.getContext('2d');
@@ -241,19 +247,32 @@
                 walls.forEach(w => ctx.fillRect(w.x, w.y, w.w, w.h));
 
                 const foodColor = { Normal: '#0f0', HighEnergy: '#0ff', Poisonous: '#f00', Carcass: '#8b4513' };
+                // Food: large white dots for visibility
                 food.forEach(f => {
                     ctx.beginPath();
-                    ctx.arc(f.pos.x, f.pos.y, 3, 0, Math.PI * 2);
-                    ctx.fillStyle = foodColor[f.f_type] || '#0f0';
+                    ctx.arc(f.pos.x, f.pos.y, 5, 0, Math.PI * 2);
+                    ctx.fillStyle = '#fff';
                     ctx.fill();
+                    // Colored ring by type
+                    ctx.strokeStyle = foodColor[f.f_type] || '#0f0';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
                 });
 
                 agents.forEach(agent => {
                     ctx.beginPath();
-                    ctx.arc(agent.x, agent.y, agent.size, 0, Math.PI * 2);
+                    const r = agent.size * (agent.species === 1 ? 1.4 : 1.0);
+                    ctx.arc(agent.x, agent.y, r, 0, Math.PI * 2);
                     const hue = agent.species === 1 ? 0 : 120;
-                    ctx.fillStyle = `hsl(${hue}, 90%, ${agent.energy > 50 ? 60 : 30}%)`;
+                    const lightness = agent.energy > 50 ? 65 : 35;
+                    ctx.fillStyle = `hsl(${hue}, 100%, ${lightness}%)`;
                     ctx.fill();
+                    // Predator outline for visibility
+                    if (agent.species === 1) {
+                        ctx.strokeStyle = '#f88';
+                        ctx.lineWidth = 1.5;
+                        ctx.stroke();
+                    }
                 });
 
                 // Sensing viz: sense-radius circle + heading (target) line per agent.
@@ -321,6 +340,14 @@
                     `Time: ${time} | ${isNight ? 'NIGHT' : 'DAY'} | Season: ${popStats.season} | Pop: ${agents.length} (Prey: ${prey} | Pred: ${pred}) | food ${food.length} | ` +
                     `speed ${avg(agents, 'speed').toFixed(2)} size ${avg(agents, 'size').toFixed(2)} sense ${avg(agents, 'sense').toFixed(2)} | ` +
                     `energy P:${preyE.toFixed(0)} R:${predE.toFixed(0)} | Births: ${popStats.births} Deaths: ${popStats.deaths}`;
+
+                // Debug overlay on canvas
+                ctx.save();
+                ctx.font = '11px monospace';
+                ctx.fillStyle = '#fff';
+                ctx.fillText(`agents:${agents.length} food:${food.length} prey:${prey} pred:${pred} t:${time}`, 5, 15);
+                ctx.fillText(`avgE_prey:${preyE.toFixed(0)} avgE_pred:${predE.toFixed(0)} births:${popStats.births} deaths:${popStats.deaths}`, 5, 28);
+                ctx.restore();
 
                 drawLines(popCtx, popChartCanvas.width, popChartCanvas.height, [
                     { data: hist.map(h => h.prey), color: '#0f0', max: 200 },
