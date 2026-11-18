@@ -276,7 +276,8 @@ pub fn step() {
                 }
 
                 match best {
-                    Some((j, d2)) if d2.sqrt() <= a.size + 3.0 => {
+                    // Prey eats food within 10px of its radius (navigation-based consumption)
+                    Some((j, d2)) if d2.sqrt() <= a.size + 10.0 => {
                         let f = &w.food[j];
                         match f.f_type {
                             FoodType::Normal => a.energy += FOOD_ENERGY * a.metabolism_eff,
